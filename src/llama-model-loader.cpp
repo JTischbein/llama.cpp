@@ -508,8 +508,10 @@ llama_model_loader::llama_model_loader(
     files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
     contexts.emplace_back(ctx);
 
+    use_direct_io = use_direct_io && files.back()->has_direct_io();
+
     // Disable mmap in case Direct I/O is enabled and available
-    if (use_direct_io && files.at(0)->has_direct_io()) {
+    if (use_direct_io && use_mmap) {
         use_mmap = false;
     }
 
@@ -722,6 +724,7 @@ llama_model_loader::llama_model_loader(
     }
 
     this->use_mmap = use_mmap;
+    this->use_direct_io = use_direct_io;
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
 }
@@ -918,7 +921,8 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
         GGML_ASSERT(cur->data != nullptr);
         GGML_ASSERT(w.idx < files.size());
         const auto & file = files.at(w.idx);
-        file->read_raw_at(cur->data, ggml_nbytes(cur), w.offs);
+        file->seek(w.offs, SEEK_SET);
+        file->read_raw(cur->data, ggml_nbytes(cur));
     }
 
     if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
@@ -1082,7 +1086,8 @@ bool llama_model_loader::load_all_data(
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                file->read_raw_at(cur->data, n_size, weight->offs);
+                file->seek(weight->offs, SEEK_SET);
+                file->read_raw(cur->data, n_size);
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
@@ -1144,7 +1149,7 @@ bool llama_model_loader::load_all_data(
                     }
                 } else {
                     read_buf.resize(n_size);
-                    file->read_raw_at(read_buf.data(), n_size, weight->offs);
+                    file->seek(weight->offs, SEEK_SET);
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
                     if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
