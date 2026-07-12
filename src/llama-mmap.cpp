@@ -150,7 +150,7 @@ struct llama_file::impl {
         return false;
 #endif
 
-        if (alignment <= 1 || (alignment & (alignment - 1)) != 0 || alignment > 64*1024*1024) {
+        if (alignment <= 1 || (alignment & (alignment - 1)) != 0 || alignment > LLAMA_FILE_IO_CHUNK_SIZE) {
             error = ERROR_NOT_SUPPORTED;
             alignment = 1;
             CloseHandle(fp_win32_direct);
@@ -198,7 +198,7 @@ struct llama_file::impl {
         const size_t read_size = std::min(len, size - offset);
         size_t bytes_read = 0;
         while (bytes_read < read_size) {
-            size_t chunk_size = std::min<size_t>(read_size - bytes_read, 64*1024*1024);
+            size_t chunk_size = std::min<size_t>(read_size - bytes_read, LLAMA_FILE_IO_CHUNK_SIZE);
             DWORD chunk_read = 0;
             BOOL result = ReadFile(fp_win32, reinterpret_cast<char*>(ptr) + bytes_read, chunk_size, &chunk_read, NULL);
             if (!result) {
@@ -233,7 +233,7 @@ struct llama_file::impl {
 
         size_t bytes_read = 0;
         while (bytes_read < len) {
-            const size_t chunk_size = std::min<size_t>(len - bytes_read, 64 * 1024 * 1024);
+            const size_t chunk_size = std::min<size_t>(len - bytes_read, LLAMA_FILE_IO_CHUNK_SIZE);
             DWORD chunk_read = 0;
             BOOL result = ReadFile(fp_win32_direct, reinterpret_cast<char *>(ptr) + bytes_read,
                                    chunk_size, &chunk_read, NULL);
@@ -249,7 +249,6 @@ struct llama_file::impl {
             bytes_read += chunk_read;
             if (chunk_read < chunk_size) {
                 if (offset + bytes_read == size) {
-                    std::memset(reinterpret_cast<char *>(ptr) + bytes_read, 0, len - bytes_read);
                     return true;
                 }
                 error = ERROR_HANDLE_EOF;
@@ -349,7 +348,7 @@ struct llama_file::impl {
     void write_raw(const void * ptr, size_t len) const {
         size_t bytes_written = 0;
         while (bytes_written < len) {
-            size_t chunk_size = std::min<size_t>(len - bytes_written, 64*1024*1024);
+            size_t chunk_size = std::min<size_t>(len - bytes_written, LLAMA_FILE_IO_CHUNK_SIZE);
             DWORD chunk_written = 0;
             BOOL result = WriteFile(fp_win32, reinterpret_cast<char const*>(ptr) + bytes_written, chunk_size, &chunk_written, NULL);
             if (!result) {
