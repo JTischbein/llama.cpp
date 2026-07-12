@@ -29,6 +29,7 @@
     #ifndef NOMINMAX
         #define NOMINMAX
     #endif
+    #include <malloc.h>
     #include <windows.h>
     #ifndef PATH_MAX
         #define PATH_MAX MAX_PATH
@@ -67,7 +68,10 @@ static std::string llama_format_win_err(DWORD err) {
 
 struct llama_file::impl {
 #if defined(_WIN32)
-    HANDLE fp_win32;
+    // Keep the buffered handle as the logical cursor; the direct handle only issues aligned I/O.
+    HANDLE fp_win32        = INVALID_HANDLE_VALUE;
+    HANDLE fp_win32_direct = INVALID_HANDLE_VALUE;
+
     std::string GetErrorMessageWin32(DWORD error_code) const {
         std::string ret;
         LPSTR lpMsgBuf = NULL;
@@ -80,10 +84,14 @@ struct llama_file::impl {
             LocalFree(lpMsgBuf);
         }
 
+        while (!ret.empty() && (ret.back() == '\r' || ret.back() == '\n')) {
+            ret.pop_back();
+        }
+
         return ret;
     }
 
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
+    impl(const char * fname, const char * mode, const bool use_direct_io = false) {
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -92,6 +100,14 @@ struct llama_file::impl {
         seek(0, SEEK_END);
         size = tell();
         seek(0, SEEK_SET);
+
+        if (use_direct_io && std::strcmp(mode, "rb") == 0) {
+            DWORD error = ERROR_SUCCESS;
+            if (!init_direct_io(error)) {
+                LLAMA_LOG_WARN("Failed to open file '%s' with unbuffered I/O: %s. Falling back to buffered I/O\n",
+                               fname, GetErrorMessageWin32(error).c_str());
+            }
+        }
     }
 
     impl(FILE * file) : owns_fp(false) {
@@ -100,6 +116,49 @@ struct llama_file::impl {
         seek(0, SEEK_END);
         size = tell();
         seek(0, SEEK_SET);
+    }
+
+    bool init_direct_io(DWORD & error) {
+        fp_win32_direct = ReOpenFile(fp_win32, GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    FILE_FLAG_NO_BUFFERING);
+        if (fp_win32_direct == INVALID_HANDLE_VALUE) {
+            error = GetLastError();
+            return false;
+        }
+
+#if _WIN32_WINNT >= 0x0602 && defined(NTDDI_VERSION) && defined(NTDDI_WIN8) && NTDDI_VERSION >= NTDDI_WIN8
+        {
+            FILE_STORAGE_INFO storage_info{};
+            if (!GetFileInformationByHandleEx(fp_win32_direct, FileStorageInfo,
+                                              &storage_info, sizeof(storage_info))) {
+                error = GetLastError();
+                CloseHandle(fp_win32_direct);
+                fp_win32_direct = INVALID_HANDLE_VALUE;
+                return false;
+            }
+
+            alignment = std::max<size_t>({ storage_info.LogicalBytesPerSector,
+                                           storage_info.PhysicalBytesPerSectorForAtomicity,
+                                           storage_info.PhysicalBytesPerSectorForPerformance,
+                                           storage_info.FileSystemEffectivePhysicalBytesPerSectorForAtomicity });
+        }
+#else
+        error = ERROR_NOT_SUPPORTED;
+        CloseHandle(fp_win32_direct);
+        fp_win32_direct = INVALID_HANDLE_VALUE;
+        return false;
+#endif
+
+        if (alignment <= 1 || (alignment & (alignment - 1)) != 0 || alignment > 64*1024*1024) {
+            error = ERROR_NOT_SUPPORTED;
+            alignment = 1;
+            CloseHandle(fp_win32_direct);
+            fp_win32_direct = INVALID_HANDLE_VALUE;
+            return false;
+        }
+
+        return true;
     }
 
     size_t tell() const {
@@ -126,10 +185,20 @@ struct llama_file::impl {
         }
     }
 
-    void read_raw(void * ptr, size_t len) {
+    void read_raw_buffered(void * ptr, size_t len, bool allow_eof) {
+        if (len == 0) {
+            return;
+        }
+
+        const size_t offset = tell();
+        if (offset > size || (!allow_eof && len > size - offset)) {
+            throw std::runtime_error("unexpectedly reached end of file");
+        }
+
+        const size_t read_size = std::min(len, size - offset);
         size_t bytes_read = 0;
-        while (bytes_read < len) {
-            size_t chunk_size = std::min<size_t>(len - bytes_read, 64*1024*1024);
+        while (bytes_read < read_size) {
+            size_t chunk_size = std::min<size_t>(read_size - bytes_read, 64*1024*1024);
             DWORD chunk_read = 0;
             BOOL result = ReadFile(fp_win32, reinterpret_cast<char*>(ptr) + bytes_read, chunk_size, &chunk_read, NULL);
             if (!result) {
@@ -141,6 +210,134 @@ struct llama_file::impl {
 
             bytes_read += chunk_read;
         }
+
+        if (bytes_read < len) {
+            std::memset(reinterpret_cast<char *>(ptr) + bytes_read, 0, len - bytes_read);
+        }
+    }
+
+    bool read_raw_direct(void * ptr, size_t len, size_t offset, DWORD & error) {
+        if ((offset & (alignment - 1)) != 0 ||
+            (len & (alignment - 1)) != 0 ||
+            (reinterpret_cast<uintptr_t>(ptr) & (alignment - 1)) != 0) {
+            error = ERROR_INVALID_PARAMETER;
+            return false;
+        }
+
+        LARGE_INTEGER li;
+        li.QuadPart = offset;
+        if (!SetFilePointerEx(fp_win32_direct, li, NULL, FILE_BEGIN)) {
+            error = GetLastError();
+            return false;
+        }
+
+        size_t bytes_read = 0;
+        while (bytes_read < len) {
+            const size_t chunk_size = std::min<size_t>(len - bytes_read, 64 * 1024 * 1024);
+            DWORD chunk_read = 0;
+            BOOL result = ReadFile(fp_win32_direct, reinterpret_cast<char *>(ptr) + bytes_read,
+                                   chunk_size, &chunk_read, NULL);
+            if (!result) {
+                error = GetLastError();
+                if (error == ERROR_HANDLE_EOF && offset + bytes_read == size) {
+                    std::memset(reinterpret_cast<char *>(ptr) + bytes_read, 0, len - bytes_read);
+                    return true;
+                }
+                return false;
+            }
+
+            bytes_read += chunk_read;
+            if (chunk_read < chunk_size) {
+                if (offset + bytes_read == size) {
+                    std::memset(reinterpret_cast<char *>(ptr) + bytes_read, 0, len - bytes_read);
+                    return true;
+                }
+                error = ERROR_HANDLE_EOF;
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    void fallback_to_buffered_io(DWORD error) {
+        LLAMA_LOG_WARN("%s: Falling back to buffered I/O due to %s\n", __func__, GetErrorMessageWin32(error).c_str());
+        CloseHandle(fp_win32_direct);
+        fp_win32_direct = INVALID_HANDLE_VALUE;
+        alignment = 1;
+    }
+
+    void read_aligned_chunk(void * dest, size_t len) {
+        if (len == 0) {
+            return;
+        }
+
+        const size_t offset = tell();
+        if (offset > size || len > size - offset) {
+            throw std::runtime_error("unexpectedly reached end of file");
+        }
+
+        const size_t aligned_offset = offset & ~(alignment - 1);
+        const size_t offset_from_alignment = offset - aligned_offset;
+        if (len > (size_t) -1 - offset_from_alignment - (alignment - 1)) {
+            throw std::runtime_error("read size is too large");
+        }
+        const size_t bytes_to_read = (offset_from_alignment + len + alignment - 1) & ~(alignment - 1);
+
+        void * raw_buffer = _aligned_malloc(bytes_to_read, alignment);
+        if (raw_buffer == nullptr) {
+            fallback_to_buffered_io(ERROR_NOT_ENOUGH_MEMORY);
+            read_raw_buffered(dest, len, false);
+            return;
+        }
+
+        struct aligned_buffer_deleter {
+            void operator()(void * p) const { _aligned_free(p); }
+        };
+        std::unique_ptr<void, aligned_buffer_deleter> buffer(raw_buffer);
+
+        DWORD error = ERROR_SUCCESS;
+        if (!read_raw_direct(buffer.get(), bytes_to_read, aligned_offset, error)) {
+            fallback_to_buffered_io(error);
+            read_raw_buffered(dest, len, false);
+            return;
+        }
+
+        memcpy(dest, reinterpret_cast<char *>(buffer.get()) + offset_from_alignment, len);
+        seek(offset + len, SEEK_SET);
+    }
+
+    void read_raw(void * ptr, size_t len) {
+        if (has_direct_io()) {
+            read_aligned_chunk(ptr, len);
+        } else {
+            read_raw_buffered(ptr, len, false);
+        }
+    }
+
+    void read_raw_unsafe(void * ptr, size_t len) {
+        if (len == 0) {
+            return;
+        }
+
+        if (!has_direct_io()) {
+            read_raw_buffered(ptr, len, true);
+            return;
+        }
+
+        const size_t offset = tell();
+        if (offset > size) {
+            throw std::runtime_error("unexpectedly reached end of file");
+        }
+
+        DWORD error = ERROR_SUCCESS;
+        if (!read_raw_direct(ptr, len, offset, error)) {
+            fallback_to_buffered_io(error);
+            read_raw_buffered(ptr, len, true);
+            return;
+        }
+
+        seek(len > size - offset ? size : offset + len, SEEK_SET);
     }
 
     uint32_t read_u32() {
@@ -171,10 +368,13 @@ struct llama_file::impl {
     }
 
     bool has_direct_io() const {
-        return true;
+        return fp_win32_direct != INVALID_HANDLE_VALUE && alignment > 1;
     }
 
     ~impl() {
+        if (fp_win32_direct != INVALID_HANDLE_VALUE) {
+            CloseHandle(fp_win32_direct);
+        }
         if (fp && owns_fp) {
             std::fclose(fp);
         }
@@ -425,11 +625,7 @@ int llama_file::file_id() const {
 
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
 void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
-#ifdef _WIN32
-void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
-#else
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
-#endif
 
 uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
 
