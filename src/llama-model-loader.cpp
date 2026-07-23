@@ -7,10 +7,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <iostream>
 #include <regex>
 
 static const size_t kiB = 1024;
@@ -1527,6 +1529,9 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    // START HERE
+    const auto t_load_start = std::chrono::steady_clock::now();
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1691,6 +1696,14 @@ bool llama_model_loader::load_all_data(
             // cancellation since we need to free allocations.
             return progress_callback(1.0f, progress_callback_user_data);
         }
+    }
+
+
+    // STOP HERE
+    {
+        const auto t_load_end = std::chrono::steady_clock::now();
+        const double t_load_s = std::chrono::duration<double>(t_load_end - t_load_start).count();
+        std::cout << "load tensors: " << t_load_s << " s\n";
     }
 
     return true;
